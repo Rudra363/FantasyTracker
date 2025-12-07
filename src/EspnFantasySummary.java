@@ -1,25 +1,27 @@
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.*;
 
+/**
+ * Will calculate some basic week stats. Only works if ran on sunday due to some things I have
+ * yet to fix. If this does not work for you message me. You gotta change some running things
+ * since the league is set to private.
+ */
 public class EspnFantasySummary {
-
   private static final String GAME_KEY = "fba";
   private static final int SEASON = 2026;
   private static final long LEAGUE_ID = 313165618L;
 
   private static final boolean PRIVATE_LEAGUE = true;
-
   private static final int MAX_STARTERS = 10;
+  private static final int ROLLING_DAYS = 7;
 
   private static final HttpClient HTTP = HttpClient.newHttpClient();
   private static final ObjectMapper MAPPER = new ObjectMapper();
-
   private static final double EPS = 1e-9;
 
   private static class TeamAgg {
@@ -43,11 +45,8 @@ public class EspnFantasySummary {
           "Could not determine current scoringPeriodId / currentMatchupPeriod.");
     }
 
-    int detectedWeekStartSp =
-        findWeekStartScoringPeriodIdByMatchupBoundary(currentSp, currentMp, firstSp);
-
-    int weekStartSp = Math.min(currentSp, detectedWeekStartSp + 1);
-    int weekEndSp = currentSp;
+    int startSp = Math.max(firstSp, currentSp - (ROLLING_DAYS - 1));
+    int endSp = currentSp;
 
     JsonNode scoreboard = fetchJson(String.format(
         "https://lm-api-reads.fantasy.espn.com/apis/v3/games/%s/seasons/%d/segments/0/leagues/%d" +
@@ -82,7 +81,7 @@ public class EspnFantasySummary {
       }
     }
 
-    for (int sp = weekStartSp; sp <= weekEndSp; sp++) {
+    for (int sp = startSp; sp <= endSp; sp++) {
       JsonNode dayRoot = fetchJson(String.format(
           "https://lm-api-reads.fantasy.espn.com/apis/v3/games/%s/seasons/%d/segments/0/leagues/%d" +
               "?view=mTeam&view=mRoster&view=mLiveScoring&scoringPeriodId=%d",
@@ -98,30 +97,22 @@ public class EspnFantasySummary {
 
         List<JsonNode> starters = collectStarters(team);
 
-        int playedToday = 0;
         for (JsonNode entry : starters) {
           JsonNode player = entry.path("playerPoolEntry").path("player");
           if (didPlayThisDay(player, sp)) {
-            playedToday++;
+            agg.gamesPlayed++;
           }
         }
-
-        agg.gamesPlayed += playedToday;
       }
     }
 
     System.out.println();
-    System.out.println("╔══════════════════════════════════════════════════════╗");
-    System.out.printf("║  Week Summary (Matchup %d)                            ║%n", currentMp);
-    System.out.println("╠══════════════════════════════════════════════════════╣");
-    System.out.printf("║  Scoring Periods: %d → %d (today)                      ║%n", weekStartSp,
-        currentSp);
-    System.out.println("╚══════════════════════════════════════════════════════╝");
+    System.out.println("Current Week" + "(Machup " + currentMp + ")");
     System.out.println();
-
-    System.out.printf("%-24s %12s %12s %12s%n",
-        "Team", "Games", "Points", "Avg/Game");
-    System.out.println("---------------------------------------------------------------");
+    System.out.printf("%-24s %14s %12s %12s%n",
+        "Team", "Games (Last 7)", "Week Points", "Avg/Game");
+    System.out.println(
+        "--------------------------------------------------------------------------");
 
     List<Long> ids = new ArrayList<>(teams.keySet());
     ids.sort(Comparator.naturalOrder());
@@ -129,56 +120,11 @@ public class EspnFantasySummary {
     for (long id : ids) {
       TeamAgg t = teams.get(id);
       double avg = (t.gamesPlayed == 0) ? 0.0 : (t.weekPoints / t.gamesPlayed);
-      System.out.printf("%-24s %12d %12.2f %12.2f%n",
+      System.out.printf("%-24s %14d %12.2f %12.2f%n",
           trimTo(t.name, 24), t.gamesPlayed, t.weekPoints, avg);
     }
-    System.out.println("---------------------------------------------------------------");
-  }
-
-  /**
-   * Find the first scoringPeriodId that belongs to the CURRENT matchupPeriodId
-   * by walking backwards until ESPN's schedule matchupPeriodId changes.
-   */
-  private static int findWeekStartScoringPeriodIdByMatchupBoundary(int currentSp, int currentMp,
-                                                                   int firstSp) throws Exception {
-    int sp = currentSp;
-
-    for (int i = 0; i < 10 && sp >= firstSp; i++, sp--) {
-      int mpAtSp = matchupPeriodIdForScoringPeriod(sp);
-      if (mpAtSp == -1) {
-        continue;
-      }
-
-      if (mpAtSp != currentMp) {
-        return sp + 1;
-      }
-    }
-
-    return Math.max(firstSp, currentSp - 6);
-  }
-
-  /**
-   * Get matchupPeriodId at a specific scoringPeriodId by reading schedule[*].matchupPeriodId.
-   */
-  private static int matchupPeriodIdForScoringPeriod(int scoringPeriodId) throws Exception {
-    JsonNode root = fetchJson(String.format(
-        "https://lm-api-reads.fantasy.espn.com/apis/v3/games/%s/seasons/%d/segments/0/leagues/%d" +
-            "?view=mScoreboard&scoringPeriodId=%d",
-        GAME_KEY, SEASON, LEAGUE_ID, scoringPeriodId
-    ));
-
-    JsonNode schedule = root.path("schedule");
-    if (!schedule.isArray() || schedule.size() == 0) {
-      return -1;
-    }
-
-    for (JsonNode m : schedule) {
-      int mp = m.path("matchupPeriodId").asInt(-1);
-      if (mp != -1) {
-        return mp;
-      }
-    }
-    return -1;
+    System.out.println(
+        "--------------------------------------------------------------------------");
   }
 
   /**
@@ -200,8 +146,7 @@ public class EspnFantasySummary {
   }
 
   /**
-   * Counts as "played" if we find an ACTUAL stat line (statSourceId==0) for that scoringPeriodId
-   * and the stats map contains at least one non-zero value.
+   * "Played" if actual stat line exists and at least one stat is non-zero.
    */
   private static boolean didPlayThisDay(JsonNode player, int scoringPeriodId) {
     JsonNode statsArray = player.path("stats");
@@ -233,9 +178,6 @@ public class EspnFantasySummary {
     return false;
   }
 
-  /**
-   * Prefer live totals when present; otherwise fall back.
-   */
   private static double pickPoints(JsonNode side) {
     if (side.hasNonNull("totalPointsLive")) {
       return side.path("totalPointsLive").asDouble(0.0);
@@ -244,6 +186,13 @@ public class EspnFantasySummary {
       return side.path("totalPoints").asDouble(0.0);
     }
     return 0.0;
+  }
+
+  private static String padRight(String s, int n) {
+    if (s.length() >= n) {
+      return s;
+    }
+    return s + " ".repeat(n - s.length());
   }
 
   private static String trimTo(String s, int n) {
